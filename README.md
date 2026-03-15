@@ -1,2 +1,2 @@
-# sparse_matrix_algorithms
-FEAST, Zolotarev filter, Chebyshev filter
+# sparse_matrix_algorithms v 1.0
+FEAST, Zolotarev filter, Chebyshev filter, polfed
