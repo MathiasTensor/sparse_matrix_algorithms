@@ -113,9 +113,8 @@
 # - σ           : center for delta-like filters
 #
 # BROUGHT TO YOU BY THE POWER OF CHATGPT-5.2
-# EDITING: Orel 10/3/2026
-# * If editing file/want to add things, give your surname and date in the comment above, and briefly describe what you changed
 # ==============================================================================
+#TODO Lock converged vectors efficiently without degrading the quality of the others. How to make a reasonable locking tolerance where the other ones wont degrade due to locking a part of the space?
 
 using LinearAlgebra
 using SparseArrays
@@ -135,10 +134,6 @@ try
 catch
     @warn "MKLSparse.jl not installed/available"
 end
-
-###########################################################################
-####################### MATRIX - FREE FUNCTIONS ###########################
-###########################################################################
 
 """
     MatrixFreeRealSymOp{F,G}
@@ -194,7 +189,7 @@ Block matrix-free application of a real symmetric operator `A` to a block of vec
         return Y
     else
         n,m=size(X)
-        @inbounds for j in 1:m
+        Threads.@threads for j in 1:m
             mul!(view(Y,:,j),A,view(X,:,j))
         end
         return Y
@@ -239,6 +234,59 @@ function make_thin_orth_workspace(::Type{Float64},n::Int,m0::Int)
     Qtmp=Matrix{Float64}(undef,n,m0)
     τ=Vector{Float64}(undef,min(n,m0))
     return Qtmp,τ
+end
+
+"""
+    orth_against!(W,Q)
+
+Project block `W` orthogonally against the column space of `Q`:
+
+    W ← W - Q(Q^T W).
+
+This is the standard orthogonal projector used in block orthogonalization.
+"""
+function orth_against!(W::AbstractMatrix{Float64},Q::AbstractMatrix{Float64})
+    size(Q,2)==0 && return W
+    W.-=Q*(transpose(Q)*W)
+    return W
+end
+
+"""
+    orth_block!(Q;rtol=1e-12)
+
+Return an orthonormal basis for the columns of `Q`, truncating nearly dependent
+directions using the diagonal of the QR R-factor.
+
+Criterion
+---------
+If `R=QR` and `r0=max|R_ii|`, keep only columns with
+
+    |R_ii| > rtol*r0.
+
+This acts as a numerical rank-revealing QR truncation.
+"""
+function orth_block!(Q::AbstractMatrix{Float64};rtol::Float64=1e-12)
+    F=qr!(Q)
+    R=Matrix(F.R)
+    k=min(size(R,1),size(R,2))
+    k==0 && return Matrix{Float64}(undef,size(Q,1),0)
+    dr=abs.(diag(R[1:k,1:k]))
+    r0=maximum(dr)
+    r0==0 && return Matrix{Float64}(undef,size(Q,1),0)
+    r=count(>(rtol*r0),dr)
+    r==0 && return Matrix{Float64}(undef,size(Q,1),0)
+    return Matrix(F.Q[:,1:r])
+end
+
+# helper to orthogonalize a new block against a locked subspace so as to potentially reduce the workload after each iteration
+function append_locked!(Xlock::Matrix{Float64},Xnew::Matrix{Float64};rtol::Float64=1e-12)
+    size(Xnew,2)==0 && return Xlock
+    if size(Xlock,2)>0
+        Xnew.-=Xlock*(transpose(Xlock)*Xnew)
+    end
+    Qnew=orth_block!(copy(Xnew);rtol=rtol)
+    size(Qnew,2)==0 && return Xlock
+    return size(Xlock,2)==0 ? Qnew : hcat(Xlock,Qnew)
 end
 
 """
@@ -317,10 +365,6 @@ function gershgorin_bounds(A::SparseMatrixCSC{Float64,Int})
     end
     return minimum(d.-r),maximum(d.+r)
 end
-
-########################################################
-############### CHEBYSHEV FILTER COEFFS ################
-########################################################
 
 """
     jackson_kernel(K)
@@ -476,93 +520,118 @@ function scaled_mul!(Y::Matrix{Float64},A::MatrixFreeRealSymOp,X::Matrix{Float64
     return nothing
 end
 
+struct Chebyshev_workspace
+    b1::Matrix{Float64}
+    b2::Matrix{Float64}
+    tmp::Matrix{Float64}
+    ax::Matrix{Float64}
+end
 """
-    apply_cheb_filter!(Y::Matrix{Float64},A::SparseMatrixCSC{Float64,Int},Q::Matrix{Float64},coeffs::Vector{Float64},smin::Float64,smax::Float64,U0::Matrix{Float64},U1::Matrix{Float64},U2::Matrix{Float64},AX::Matrix{Float64})
+    Chebyshev_workspace(n,b)
 
-Apply the Chebyshev polynomial filter of `A` with coefficients `coeffs` to the block `Q`.
-
-The matrix is first rescaled to
-    Â = (A-cI)/d
-where
-    c = (smin+smax)/2, d = (smax-smin)/2
-
-so that σ(Â) ⊂ [-1,1].
-
-The output is
-    Y = Σ_{k=0}^m coeffs[k+1] T_k(Â) Q.
+Allocate a workspace for block size `b` in dimension `n`.
 """
-function apply_cheb_filter!(Y::Matrix{Float64},A::SparseMatrixCSC{Float64,Int},Q::Matrix{Float64},coeffs::Vector{Float64},smin::Float64,smax::Float64,U0::Matrix{Float64},U1::Matrix{Float64},U2::Matrix{Float64},AX::Matrix{Float64};multithreading::Bool=false)
-    m=length(coeffs)-1
-    n,blk=size(Q) # n is matrix size, blk is block size (number of vectors in Q)
-    c=0.5*(smin+smax) # center of spectral interval
-    d=0.5*(smax-smin) # half-width of spectral interval
-    d>0 || throw(ArgumentError("need smin < smax"))
-    # U0 = T0(Â)Q = Q
-    copyto!(U0,Q) # workspace for T_k(Â) * Q
-    fill!(Y,0.0) # workspace for the output
-    c0=coeffs[1] # contribution of T_0(Â) * Q = Q
-    @inbounds for j in 1:blk, i in 1:n
-        Y[i,j]=c0*U0[i,j] # Y <- c_0 * U_0 = c_0 * T_0(Â) * Q = c_0 * Q
-    end
-    m==0 && return nothing # if the poly has degree 0, then p_0(x) = c_0m is a constant and we are done
-    # the first chebyshev polynomial is T_1(x) = x (so T_1(Â) = Â), so U1 = T1(Â) * Q = Â * Q
-    scaled_mul!(U1,A,Q,c,d,AX) # U1 = T1(Â) * Q = Â * Q
-    c1=coeffs[2] # contribution of U1 = T_1(Â) * Q = Â * Q
-    LinearAlgebra.BLAS.axpy!(c1,vec(U1),vec(Y)) # now we add the first (linear) term (c_1) to the output Y as Y <- Y + c_1 * U_1 = c_0 * Q + c_1 * Â * Q
-    m==1 && return nothing # if order of polynomial is 1, then we are done
-    # now we use the three-term recurrence for Chebyshev polynomials to compute U_k = T_k(Â) * Q for k=2,...,m:
-    # U_k = 2 * Â * U_{k-1} - U_{k-2}, from T_{k+1}(x) = 2x * T_k(x)-T_{k-1}(x).
-    # at the start of each iteration U0 hold T_{k-1}(Â) * Q and U1 holds T_k(Â) * Q, so we can compute U_{k+1} = 2Â * U_k - U_{k-1} = 2Â * U1 - U0
-    invd=1/d
-    @inbounds for k in 1:(m-1) # sequential 3-term reccurence
-        # U2 = 2ÂU1 - U0
-        mul!(AX,A,U1) # AX = A * U1 (not Â)
-        for j in 1:blk
-            for i in 1:n
-            U2[i,j]=2*((AX[i,j]-c*U1[i,j])*invd)-U0[i,j] # U2 = 2Â * U1 - U0 = 2((A - cI) / d) * U1 - U0 = 2(A * U1 - c * U1)/d - U0; because A in the previous line is not scaled Â, we need to do the scaling here
-        
+Chebyshev_workspace(n::Int,b::Int)=Chebyshev_workspace(zeros(n,b),zeros(n,b),zeros(n,b),zeros(n,b))
+"""
+    apply_poly_block!(Y,A,Q,coeffs,smin,smax,work)
+
+Apply the Chebyshev polynomial filter to a block `Q` for an explicit sparse A.
+
+Output
+------
+Computes approximately
+
+    Y = p(Â)Q,   Â=(A-cI)/d.
+
+Method
+------
+Uses a block Clenshaw recurrence for stability:
+
+    b_{K+1}=b_{K+2}=0,
+    b_k = α_k Q + 2Â b_{k+1} - b_{k+2},
+    p(Â)Q = α_0 Q + Â b_1 - b_2.
+"""
+function apply_poly_block!(Y::AbstractMatrix{Float64},A::SparseMatrixCSC{Float64,Int},Q::AbstractMatrix{Float64},coeffs::AbstractVector{Float64},smin::Float64,smax::Float64,work::Chebyshev_workspace)
+    # Apply Y = p(Â)Q by block Clenshaw recurrence, where Â=(A-cI)/d.
+    # Recurrence:
+    #   B_{K+1}=B_{K+2}=0
+    #   B_k = α_k Q + 2 Â B_{k+1} - B_{k+2},   k=K,...,1
+    #   Y   = α₀ Q + Â B₁ - B₂
+    #   Dominant cost: repeated block applications of A.
+    K=length(coeffs)-1
+    c=0.5*(smin+smax)
+    invd=2.0/(smax-smin)
+    α=2.0*invd
+    β=-2.0*c*invd
+    B1=work.b1
+    B2=work.b2
+    TMP=work.tmp
+    AX=work.ax
+    n,b=size(Q)
+    fill!(B1,0.0)
+    fill!(B2,0.0)
+    @inbounds for k=(K+1):-1:2
+        mul!(AX,A,B1)
+        ck=coeffs[k]
+        for j in 1:b
+            @simd for i in 1:n
+                TMP[i,j]=ck*Q[i,j]+α*AX[i,j]+β*B1[i,j]-B2[i,j]
             end
         end
-        ck1=coeffs[k+2] # contribution of U_{k+1} = T_{k+1}(Â) * Q (shifted by 1 index because coeffs[1] is for T_0 ...)
-        LinearAlgebra.BLAS.axpy!(ck1,vec(U2),vec(Y)) # add the contribution of U_{k+1} = T_{k+1}(Â) * Q to the output Y
-        U0,U1,U2=U1,U2,U0 # reasing workspaces for the next iteration: now U0 holds T_k(Â) * Q and U1 holds T_{k+1}(Â) * Q for the next iteration
+        B1,B2,TMP=TMP,B1,B2
     end
-    return nothing
+    mul!(AX,A,B1)
+    c0=coeffs[1]
+    @inbounds for j in 1:b
+        @simd for i in 1:n
+            Y[i,j]=c0*Q[i,j]+invd*AX[i,j]-c*invd*B1[i,j]-B2[i,j]
+        end
+    end
+    return Y
 end
 
 """
-    apply_cheb_filter!(Y::Matrix{Float64},A::MatrixFreeRealSymOp,Q::Matrix{Float64},coeffs::Vector{Float64},smin::Float64,smax::Float64,U0::Matrix{Float64},U1::Matrix{Float64},U2::Matrix{Float64},AX::Matrix{Float64})
+    apply_poly_block!(Y,Aop,Q,coeffs,smin,smax,work)
 
-Apply the Chebyshev polynomial filter of `A` with coefficients `coeffs` to the block `Q`, where now `A` is a linear map.
-
+Apply the Chebyshev polynomial filter to a block `Q` for a matrix-free operator. This is the generic version where the operator is accessed only through `apply_A_block!`.
 """
-function apply_cheb_filter!(Y::Matrix{Float64},A::MatrixFreeRealSymOp,Q::Matrix{Float64},coeffs::Vector{Float64},smin::Float64,smax::Float64,U0::Matrix{Float64},U1::Matrix{Float64},U2::Matrix{Float64},AX::Matrix{Float64})
-    m=length(coeffs)-1
-    n,blk=size(Q) # blk is the number of vector columns
-    c=0.5*(smin+smax) # center of the window
-    d=0.5*(smax-smin) # half width of the window
-    copyto!(U0,Q) #U0 is the workspace before accumulating to Y (both Q and U0/1/2 are workspaces - there are 3 for U due to three term recurrence relation for the chebyshev polys)
-    fill!(Y,0.0) # initialize the output
-    c0=coeffs[1] # first coeff (constant) cheb poly
-    @inbounds for j in 1:blk, i in 1:n
-        Y[i,j]=c0*U0[i,j] # add the first contribution to Y from the constant term cheb poly
-    end
-    m==0 && return nothing # if constant, return (not the case mostly if not wrong)
-    scaled_mul!(U1,A,Q,c,d,AX) # U1 = T1(Â) * Q = Â * Q (this rescales the window to [-1,1] and computes the 1st order chebyshev poly)
-    LinearAlgebra.BLAS.axpy!(coeffs[2],vec(U1),vec(Y)) # add the 2nd order cheb poly with its weight/coefficient into the result accumulator Y
-    m==1 && return nothing # if only first order return
-    invd=1/d
-    @inbounds for k in 1:(m-1) # sequential 3-term reccurence
-        apply_A_block!(AX,A,U1) # apply matrix A (here it is a linear operator) to U1 and store into temp AX
-        for j in 1:blk
-            for i in 1:n
-            U2[i,j]=2*((AX[i,j]-c*U1[i,j])*invd)-U0[i,j] # U2 = 2Â * U1 - U0 = 2((A - cI) / d) * U1 - U0 = 2(A * U1 - c * U1)/d - U0; because A in the previous line is not scaled Â, we need to do the scaling here
+function apply_poly_block!(Y::AbstractMatrix{Float64},A::MatrixFreeRealSymOp,Q::AbstractMatrix{Float64},coeffs::AbstractVector{Float64},smin::Float64,smax::Float64,work::Chebyshev_workspace)
+    # Apply Y = p(Â)Q by block Clenshaw recurrence, where Â=(A-cI)/d.
+    # Recurrence:
+    #   B_{K+1}=B_{K+2}=0
+    #   B_k = α_k Q + 2 Â B_{k+1} - B_{k+2},   k=K,...,1
+    #   Y   = α₀ Q + Â B₁ - B₂
+    #   Dominant cost: repeated block applications of A.
+    K=length(coeffs)-1
+    c=0.5*(smin+smax)
+    invd=2.0/(smax-smin)
+    α=2.0*invd
+    β=-2.0*c*invd
+    B1=work.b1
+    B2=work.b2
+    TMP=work.tmp
+    AX=work.ax
+    n,b=size(Q)
+    fill!(B1,0.0)
+    fill!(B2,0.0)
+    @inbounds for k=(K+1):-1:2
+        apply_A_block!(AX,A,B1)
+        ck=coeffs[k]
+        for j in 1:b
+            @simd for i in 1:n
+                TMP[i,j]=ck*Q[i,j]+α*AX[i,j]+β*B1[i,j]-B2[i,j]
             end
         end
-        LinearAlgebra.BLAS.axpy!(coeffs[k+2],vec(U2),vec(Y)) # accumulate the new k-th term into the output
-        U0,U1,U2=U1,U2,U0 # reshift the indexes: T0,T1,T2 -> T3, next iter T1,T2,T3 -> T4 etc.
+        B1,B2,TMP=TMP,B1,B2
     end
-    return nothing
+    apply_A_block!(AX,A,B1)
+    c0=coeffs[1]
+    @inbounds for j in 1:b
+        @simd for i in 1:n
+            Y[i,j]=c0*Q[i,j]+invd*AX[i,j]-c*invd*B1[i,j]-B2[i,j]
+        end
+    end
+    return Y
 end
 
 """
@@ -632,10 +701,7 @@ function chebyshev_poly_real_symm_sparse(Ain::SparseMatrixCSC{Float64,Int},emin:
     Random.seed!(seed)
     Q=randn(n,m0) # initialize a random block of m0 vectors; will be replaced by the filtered subspace
     Y=Matrix{Float64}(undef,n,m0) # workspace for the filtered block Y = p(Â)Q
-    U0=Matrix{Float64}(undef,n,m0) # workspace for T_k(Â)Q in the Chebyshev recurrence
-    U1=Matrix{Float64}(undef,n,m0) # workspace for T_k(Â)Q in the Chebyshev recurrence
-    U2=Matrix{Float64}(undef,n,m0) # workspace for T_k(Â)Q in the Chebyshev recurrence
-    AXf=Matrix{Float64}(undef,n,m0) # workspace for A*Q in the Chebyshev recurrence
+    work=Chebyshev_workspace(n,m0)
     # RR workspaces
     Qtmp,Z=make_thin_orth_workspace(Float64,n,m0) # workspaces for thin orthogonalization of Q
     R=Matrix{Float64}(undef,n,m0) # workspace for A*Q in the Rayleigh-Ritz step
@@ -663,7 +729,7 @@ function chebyshev_poly_real_symm_sparse(Ain::SparseMatrixCSC{Float64,Int},emin:
     # end
     prev_ok=false # flag to allow termination after 2 consecutive iterations with maxres<tol (except immediate break at it=1)
     for it in 1:maxiter
-        apply_cheb_filter!(Y,A,Q,coeffs,smin_,smax_,U0,U1,U2,AXf) # Y = p(Â)Q - filtered block
+        apply_poly_block!(Y,A,Q,coeffs,smin_,smax_,work) # Y = p(Â)Q - filtered block
         Q.=Y # replace Q by the filtered block; will be orthogonalized in the next iteration
         thin_orth!(Q,Qtmp,Z) # orthogonalize the filtered block Q
         mul!(R,A,Q) # compute A*Q for the Rayleigh-Ritz step
@@ -730,10 +796,7 @@ function chebyshev_poly_real_symm_sparse(matvec!::F,n::Int,emin::Float64,emax::F
     Random.seed!(seed)
     Q=randn(n,m0)
     Y=Matrix{Float64}(undef,n,m0)
-    U0=Matrix{Float64}(undef,n,m0)
-    U1=Matrix{Float64}(undef,n,m0)
-    U2=Matrix{Float64}(undef,n,m0)
-    AXf=Matrix{Float64}(undef,n,m0)
+    work=Chebyshev_workspace(n,m0)
     Qtmp,Z=make_thin_orth_workspace(Float64,n,m0)
     R=Matrix{Float64}(undef,n,m0)
     Aq=Matrix{Float64}(undef,m0,m0)
@@ -745,7 +808,7 @@ function chebyshev_poly_real_symm_sparse(matvec!::F,n::Int,emin::Float64,emax::F
     inside=falses(m0)
     prev_ok=false
     for it in 1:maxiter
-        apply_cheb_filter!(Y,Ain,Q,coeffs,smin_,smax_,U0,U1,U2,AXf)
+        apply_poly_block!(Y,Ain,Q,coeffs,smin_,smax_,work)
         Q.=Y
         thin_orth!(Q,Qtmp,Z)
         apply_A_block!(R,Ain,Q)
@@ -760,7 +823,7 @@ function chebyshev_poly_real_symm_sparse(matvec!::F,n::Int,emin::Float64,emax::F
             inside[j]=(λ[j]≥emin && λ[j]≤emax && res[j]<res_gate)
         end
         maxres=any(inside) ? maximum(@view res[inside]) : Inf
-        debug && @printf("it=%d inside=%d maxres=%.3e\n",it,count(inside),maxres)
+        debug && @printf("it=%d inside=%d maxres=%.3e r90=%.3e\n",it,count(inside),maxres,isempty(res[inside]) ? Inf : quantile(res[inside],0.9))
         ok=any(inside) && (maxres<tol)
         if two_hit
             if ok && (it==1 || prev_ok)
@@ -790,18 +853,23 @@ end
 
 
 
-#######################################
-############### TESTING ###############
-#######################################
+
+
+
 
 if abspath(PROGRAM_FILE)==@__FILE__
 
     n=10_000 # size of the matrix
     BLAS.set_num_threads(Sys.CPU_THREADS) # to get max performance for testing
-    degrees_chebyshev=[16,32,48,64,96,128] # degrees of the chebyshev polynomial approximating the delta function filter
+    degrees_chebyshev=[48,64,128,256,512] # degrees of the chebyshev polynomial approximating the delta function filter
     counts_chebyshev=reverse([100,150,200,250,500,1000]) # how many eigenvalues we want in the delta window, more eigenvealues (m0), less degree we need
     do_matrix_free=true
     do_matrix_concrete=false
+
+    maxiter=10
+    show_progress=true
+    m0_pad=2.0 # multiplicative padding to the search subspace
+    tol=1e-8
 
     # 1D Laplacian tridiag(-1,2,-1)
     function lap1d(n::Int)
@@ -819,19 +887,15 @@ if abspath(PROGRAM_FILE)==@__FILE__
             y[n]=2*x[n]-x[n-1]
         end
     end
-    function lap1d_block_matvec!(Y,X)
-        n,m=size(X)
-        @inbounds begin
-            for j in 1:m
-                Y[1,j]=2X[1,j]-X[2,j]
-            end
-            for i in 2:n-1
-                for j in 1:m
-                    Y[i,j]=2*X[i,j]-X[i-1,j]-X[i+1,j]
+    function lap1d_block_matvec!(Y::AbstractMatrix{Float64},X::AbstractMatrix{Float64})
+        n,b=size(X)
+        Threads.@threads for j in 1:b
+            @inbounds begin
+                Y[1,j]=2.0*X[1,j]-X[2,j]
+                for i in 2:n-1
+                    Y[i,j]=-X[i-1,j]+2.0*X[i,j]-X[i+1,j]
                 end
-            end
-            for j in 1:m
-                Y[n,j]=2*X[n,j]-X[n-1,j]
+                Y[n,j]=-X[n-1,j]+2.0*X[n,j]
             end
         end
         return Y
@@ -839,7 +903,7 @@ if abspath(PROGRAM_FILE)==@__FILE__
     lap1d_eigs_exact(n::Int)=[2-2*cos(k*pi/(n+1)) for k in 1:n]
 
     function nearest_k_to_sigma(vals::Vector{Float64},σ::Float64,k::Int)
-        p=sortperm(abs.(vals .- σ))
+        p=sortperm(abs.(vals.-σ))
         out=vals[p[1:min(k,length(vals))]]
         sort!(out)
         return out
@@ -926,7 +990,7 @@ if abspath(PROGRAM_FILE)==@__FILE__
         λref=λ[i1:i2]
         return emin,emax,σ,collect(λref),(i1,i2)
     end
-    function test_cheb_delta_on_lap1d_count(matvec!,matblock!;n=5000,nev_target=50,center_frac=0.5,m0_pad=1.5,degree=64,tol=1e-8,maxiter=30,res_gate=1e-6,show_progress=false,window_type=:step,matrix_free=false)
+    function test_cheb_delta_on_lap1d_count(matvec!,matblock!;n=5000,nev_target=50,center_frac=0.5,degree=64,tol=1e-8,res_gate=1e-6,window_type=:step,matrix_free=false)
         smin=0.0
         smax=4.0
         A=lap1d(n)
@@ -939,9 +1003,9 @@ if abspath(PROGRAM_FILE)==@__FILE__
                 " m0=",m0," degree=",degree)
         flush(stdout)
         if matrix_free
-            λ,X,res=chebyshev_poly_real_symm_sparse(lap1d_matvec!,n,emin,emax;matblock=lap1d_block_matvec!,σ=σ,smin=smin,smax=smax,m0=m0,degree=degree,maxiter=maxiter,tol=tol,res_gate=res_gate,jackson=true,window_type=window_type)
+            λ,X,res=chebyshev_poly_real_symm_sparse(lap1d_matvec!,n,emin,emax;matblock=lap1d_block_matvec!,σ=σ,smin=smin,smax=smax,m0=m0,degree=degree,maxiter=maxiter,tol=tol,res_gate=res_gate,jackson=true,window_type=window_type,debug=show_progress,two_hit=false)
         else
-            λ,X,res=chebyshev_poly_real_symm_sparse(A,emin,emax;σ=σ,smin=smin,smax=smax,m0=m0,degree=degree,maxiter=maxiter,tol=tol,res_gate=res_gate,jackson=true, window_type=window_type)
+            λ,X,res=chebyshev_poly_real_symm_sparse(A,emin,emax;σ=σ,smin=smin,smax=smax,m0=m0,degree=degree,maxiter=maxiter,tol=tol,res_gate=res_gate,jackson=true,window_type=window_type,debug=show_progress,two_hit=false)
         end
         λ=sort(λ)
         λref=sort(λref)
@@ -958,7 +1022,7 @@ if abspath(PROGRAM_FILE)==@__FILE__
         return λ,λref,res,meta
     end
 
-    function bench_sweep_cheb_counts(;n=5000,counts=[20,50,100,150],degrees=[16,32,48,64,96,128],center_frac=0.5,maxiter=30,tol=1e-8,res_gate=1e-6,m0_pad=1.5,window_type=:step,matrix_free::Bool=false)
+    function bench_sweep_cheb_counts(;n=5000,counts=[20,50,100,150],degrees=[16,32,48,64,96,128],center_frac=0.5,tol=1e-8,res_gate=1e-6,window_type=:step,matrix_free::Bool=false)
 
         println("==========================================================================")
         println("CHEB DELTA local-count benchmark")
@@ -970,11 +1034,7 @@ if abspath(PROGRAM_FILE)==@__FILE__
         for nev in counts
             for deg in degrees
                 t=@elapsed begin
-                    λ,λref,res,meta=test_cheb_delta_on_lap1d_count(lap1d_matvec!,lap1d_block_matvec!,
-                    n=n,nev_target=nev,center_frac=center_frac,
-                    m0_pad=m0_pad,degree=deg,
-                    tol=tol,maxiter=maxiter,res_gate=res_gate,
-                    show_progress=false,window_type=window_type,matrix_free=matrix_free)
+                    λ,λref,res,meta=test_cheb_delta_on_lap1d_count(lap1d_matvec!,lap1d_block_matvec!,n=n,nev_target=nev,center_frac=center_frac,degree=deg,tol=tol,res_gate=res_gate,window_type=window_type,matrix_free=matrix_free)
                     global _λ=λ
                     global _λref=λref
                     global _res=res
@@ -1000,21 +1060,21 @@ if abspath(PROGRAM_FILE)==@__FILE__
     println("CHEBYSHEV DELTA FILTER MATRIX FREE")
     println("--------------------------------------------------")
 
-    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,maxiter=50,tol=1e-8,res_gate=1e-6,m0_pad=1.3,window_type=:delta,matrix_free=true)
+    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,tol=1e-8,res_gate=1e-6,window_type=:delta,matrix_free=true)
 
     println()
     println("--------------------------------------------------")
     println("CHEBYSHEV STEP WINDOW MATRIX FREE")
     println("--------------------------------------------------")
 
-    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,maxiter=50,tol=1e-8,res_gate=1e-6,m0_pad=1.3,window_type=:step,matrix_free=true)
+    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,tol=1e-8,res_gate=1e-6,window_type=:step,matrix_free=true)
 
     println()
     println("--------------------------------------------------")
     println("CHEBYSHEV SMOOTH WINDOW MATRIX FREE")
     println("--------------------------------------------------")
 
-    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,maxiter=50,tol=1e-8,res_gate=1e-6,m0_pad=1.3,window_type=:smooth,matrix_free=true)
+    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,tol=1e-8,res_gate=1e-6,window_type=:smooth,matrix_free=true)
 
     end
 
@@ -1027,21 +1087,21 @@ if abspath(PROGRAM_FILE)==@__FILE__
 
     println("SPARSE / CHEB DELTA")
     
-    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,maxiter=50,tol=1e-8,res_gate=1e-6,m0_pad=1.3,window_type=:delta,matrix_free=false)
+    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,tol=1e-8,res_gate=1e-6,window_type=:delta,matrix_free=false)
 
     println("--------------------------------------------------")
     println("CHEBYSHEV STEP FILTER SPARSE")
     println("--------------------------------------------------")
 
     println("SPARSE / CHEB STEP")
-    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,maxiter=50,tol=1e-8,res_gate=1e-6,m0_pad=1.3,window_type=:step,matrix_free=false)
+    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,tol=1e-8,res_gate=1e-6,window_type=:step,matrix_free=false)
 
     println("--------------------------------------------------")
     println("CHEBYSHEV SMOOTH FILTER SPARSE")
     println("--------------------------------------------------")
 
     println("SPARSE / CHEB SMOOTH")
-    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,maxiter=50,tol=1e-8,res_gate=1e-6,m0_pad=1.3,window_type=:smooth,matrix_free=false)
+    bench_sweep_cheb_counts(n=n,counts=counts_chebyshev,degrees=degrees_chebyshev,center_frac=0.5,tol=1e-8,res_gate=1e-6,window_type=:smooth,matrix_free=false)
 
     end
 
@@ -1060,13 +1120,19 @@ CHEB DELTA local-count benchmark
 ==========================================================================
      nev      deg       m0      got    match   lextra     spur     localerr
 --------------------------------------------------------------------------
-CHEBΔ count-test: n=10000 nev_target=1000 idx=[4500,5499] interval=[1.685610886680983, 2.3131481613293645] σ=1.9993794622045669 m0=1300 degree=32
+CHEBΔ count-test: n=50000 nev_target=1000 idx=[24500,25499] interval=[1.9368657406389307, 2.0628830617279608] σ=1.9998744006869607 m0=2000 degree=128
+it=1 inside=0 maxres=Inf r90=Inf
+it=2 inside=0 maxres=Inf r90=Inf
+it=3 inside=245 maxres=9.983e-07 r90=9.181e-07
+it=4 inside=982 maxres=9.882e-07 r90=1.720e-07
+it=5 inside=1003 maxres=4.247e-07 r90=3.969e-09
+it=6 inside=1003 maxres=2.088e-08 r90=4.642e-11
+it=7 inside=1003 maxres=5.394e-10 r90=1.053e-12
 matched target = 1000 / 1000
 missed target  = 0
 extra total    = 3
 legit extra    = 3
 spurious extra = 0
-    1000       32     1300     1003     1000        3        0    4.441e-15
-time[s] = 40.5311
---------------------------------------------------------------------------
+    1000      128     2000     1003     1000        3        0    3.775e-15
+time[s] = 117.0751
 =#
