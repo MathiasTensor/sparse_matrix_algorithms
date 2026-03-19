@@ -77,8 +77,6 @@
 # Reference: #   FEAST Eigensolver for Nonlinear Eigenvalue Problems, Gavin B., Międlar, A, Pollizi E. https://arxiv.org/abs/1801.09794
 #
 # BROUGHT TO YOU BY THE POWER OF CHATGPT-5.2
-# EDITING: Orel 10/3/2026
-# * If editing file/want to add things, give your surname and date in the comment above, and briefly describe what you changed
 # ==============================================================================
 
 using LinearAlgebra
