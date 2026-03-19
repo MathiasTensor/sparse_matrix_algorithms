@@ -27,7 +27,7 @@ Applying p(Â) to a block Q amplifies components belonging to eigenvectors
 whose eigenvalues lie in the target window.
 [Implemented by `apply_poly_block!(...)` via a block Clenshaw recurrence.]
 
-We then build a block Krylov/Lanczos-type basis in the filtered operator:
+We then build a block Lanczos-type basis in the filtered operator:
 
     Q_1 given,
     W_j = p(Â)Q_j - Q_{j-1}B_{j-1}^T,
@@ -55,25 +55,25 @@ Then solve the dense reduced problem
 
     T u = θ u,
 
-[Implemented in `extract_pairs_direct(...)` via `E = eigen(T)`.]
+[Implemented in `extract_pairs(...)` via `E = eigen(T)`.]
 
 reconstruct Ritz vectors of the original problem
 
     x = V_m u,
 
-[Implemented in `extract_pairs_direct(...)` by `build_X!(...)`.]
+[Implemented in `extract_pairs(...)` by `build_X!(...)`.]
 
 and evaluate original Rayleigh quotients and residuals with A:
 
     λ = x^T A x,
     r = ||Ax - λx||_2.
 
-[Implemented by `rayleigh!(...)`, called inside `extract_pairs_direct(...)`.]
+[Implemented by `rayleigh!(...)`, called inside `extract_pairs(...)`.]
 
 Finally keep only vectors with λ ∈ [emin,emax], optionally refine them by a
 Rayleigh–Ritz step in the original operator, and return the best pairs.
 [Interval filtering, residual sorting, and final selection are done in
-`extract_pairs_direct(...)`.
+`extract_pairs(...)`.
 Optional original-space refinement is performed by `refine_original_rr(...)`.
 The top-level is `polfed(...)`.]
 
@@ -116,12 +116,21 @@ Window choices
 REF: Polynomially Filtered Exact Diagonalization Approach to Many-Body Localization; Sierant P., Lewenstein M., Zakrzewski J. https://arxiv.org/abs/2005.09534
 
 # BROUGHT TO YOU BY THE POWER OF CHATGPT-5.2
-# EDITING: Orel 10/3/2026
-# * If editing file/want to add things, give your surname and date in the comment above, and briefly describe what you changed
 # ==============================================================================
 =#
 
 using LinearAlgebra,SparseArrays,Random,ProgressMeter
+
+try
+    @eval using MKL
+catch
+    @warn "MKL.jl not installed/available"
+end
+try
+    @eval using MKLSparse
+catch
+    @warn "MKLSparse.jl not installed/available"
+end
 
 """
     MatrixFreeRealSymOp{F,G}
@@ -232,10 +241,6 @@ function scaled_apply_vec!(y::AbstractVector{Float64},A,x,c::Float64,d::Float64,
     return y
 end
 
-########################################################
-################ GERSHGORIN BOUNDS #####################
-########################################################
-
 """
     gershgorin_bounds(A)
 
@@ -259,10 +264,6 @@ function gershgorin_bounds(A::SparseMatrixCSC{Float64,Int})
     end
     return minimum(d.-rowsums),maximum(d.+rowsums)
 end
-
-########################################################
-############### CHEBYSHEV FILTER COEFFS ################
-########################################################
 
 """
     jackson_kernel(K)
@@ -412,10 +413,6 @@ function _build_coeffs(degree,smin,smax,sigma,emin,emax;window_type::Symbol=:ste
            error("Unknown window type: $window_type")
 end
 
-########################################################
-################ FILTERED BLOCK APPLY ##################
-########################################################
-
 """
     POLFEDWorkspace(n,b)
 
@@ -546,10 +543,6 @@ function apply_poly_block!(Y::AbstractMatrix{Float64},A::MatrixFreeRealSymOp,Q::
     end
     return Y
 end
-
-########################################################
-################ ORTHOGONALIZATION #####################
-########################################################
 
 """
     orth_block_polfed!(Q;rtol=1e-12)
@@ -691,10 +684,6 @@ function block_qr_factor(W::AbstractMatrix{Float64};rtol::Float64=1e-12)
     return Matrix(F.Q[:,1:r]),Matrix(R[1:r,1:size(W,2)])
 end
 
-########################################################
-################ REDUCED MATRIX HELPERS ################
-########################################################
-
 """
     assemble_T(Ablocks,Bblocks)
 
@@ -785,10 +774,6 @@ function build_X!(X::AbstractMatrix{Float64},Qhist::Vector{Matrix{Float64}},U::A
     end
     return X
 end
-
-########################################################
-################ RR / RESIDUALS ########################
-########################################################
 
 """
     rayleigh!(λ,res,AX,A,X)
@@ -894,12 +879,8 @@ function refine_original_rr(A,X)
     return λ[p],Y[:,p],res[p]
 end
 
-########################################################
-################ PAPER-STYLE EXTRACTION ################
-########################################################
-
 """
-    extract_pairs_direct(Qhist,Ablocks,Bblocks,A;nev,emin,emax,overextract=2,refine=true,extra_keep=8)
+    extract_pairs(Qhist,Ablocks,Bblocks,A;nev,emin,emax,overextract=2,refine=true,extra_keep=8,chunk=64)
 
 Extract approximate eigenpairs of the original problem from the reduced basis.
 
@@ -908,7 +889,7 @@ Returns
 `(λf,Xf,rf,θsel)` where `θsel` are the selected reduced eigenvalues before
 original-space filtering.
 """
-function extract_pairs_direct(Qhist::Vector{Matrix{Float64}},Ablocks::Vector{Matrix{Float64}},Bblocks::Vector{Matrix{Float64}},A;nev::Int,emin::Float64,emax::Float64,overextract::Int=2,refine::Bool=true,extra_keep::Int=8)
+function extract_pairs(Qhist::Vector{Matrix{Float64}},Ablocks::Vector{Matrix{Float64}},Bblocks::Vector{Matrix{Float64}},A;nev::Int,emin::Float64,emax::Float64,overextract::Int=2,refine::Bool=true,extra_keep::Int=8,chunk::Int=64)
     # ------------------------------------------------------------
     # Direct extraction of approximate eigenpairs from reduced basis
     # ------------------------------------------------------------
@@ -953,23 +934,42 @@ function extract_pairs_direct(Qhist::Vector{Matrix{Float64}},Ablocks::Vector{Mat
     E=eigen(T)
     m=min(length(E.values),max(overextract*nev,nev+extra_keep))
     p=sortperm(E.values;rev=true)[1:m]
+    θsel=E.values[p]
     Usel=E.vectors[:,p]
     n=size(Qhist[1],1)
-    X=zeros(Float64,n,m)
-    AX=zeros(Float64,n,m)
-    λ=zeros(Float64,m)
-    res=zeros(Float64,m)
-    build_X!(X,Qhist,Usel)
-    rayleigh!(λ,res,AX,A,X)
-    inside=findall(i->emin<=λ[i]<=emax,1:m)
-    isempty(inside) && return Float64[],Matrix{Float64}(undef,n,0),Float64[],E.values[p]
-    λc=copy(λ[inside])
-    resc=copy(res[inside])
-    Xc=copy(X[:,inside])
+    λ_keep=Float64[]
+    res_keep=Float64[]
+    idx_keep=Int[]
+    for j0 in 1:chunk:m
+        j1=min(j0+chunk-1,m)
+        bs=j1-j0+1
+        Uchunk=@view Usel[:,j0:j1]
+        Xchunk=zeros(Float64,n,bs)
+        AXchunk=zeros(Float64,n,bs)
+        λchunk=zeros(Float64,bs)
+        reschunk=zeros(Float64,bs)
+        build_X!(Xchunk,Qhist,Uchunk)
+        rayleigh!(λchunk,reschunk,AXchunk,A,Xchunk)
+        @inbounds for j in 1:bs
+            if emin<=λchunk[j]<=emax
+                push!(λ_keep,λchunk[j])
+                push!(res_keep,reschunk[j])
+                push!(idx_keep,j0+j-1)
+            end
+        end
+    end
+    isempty(idx_keep) && return Float64[],Matrix{Float64}(undef,n,0),Float64[],θsel
+    npre=min(length(res_keep),nev+extra_keep)
+    ps0=sortperm(res_keep)[1:npre]
+    λc=λ_keep[ps0]
+    resc=res_keep[ps0]
+    idxc=idx_keep[ps0]
+    Xc=zeros(Float64,n,npre)
+    build_X!(Xc,Qhist,@view Usel[:,idxc])
     if refine
         λc,Xc,resc=refine_original_rr(A,Xc)
         inside2=findall(i->emin<=λc[i]<=emax,1:length(λc))
-        isempty(inside2) && return Float64[],Matrix{Float64}(undef,n,0),Float64[],E.values[p]
+        isempty(inside2) && return Float64[],Matrix{Float64}(undef,n,0),Float64[],θsel
         λc=λc[inside2]
         resc=resc[inside2]
         Xc=Xc[:,inside2]
@@ -980,203 +980,28 @@ function extract_pairs_direct(Qhist::Vector{Matrix{Float64}},Ablocks::Vector{Mat
     Xf=Xc[:,ps]
     rf=resc[ps]
     pe=sortperm(λf)
-    return λf[pe],Xf[:,pe],rf[pe],E.values[p]
-end
-
-########################################################
-################ CONVERGENCE / LOGGING #################
-########################################################
-
-"""
-    count_reduced_converged(T,Bnext;p_thresh=0.17,tol=1e-12)
-
-Count reduced eigenvectors of T whose trailing coupling through the last block
-is numerically negligible.
-
-Criterion
----------
-For a reduced eigenpair `(θ,u)` of T, let `u_tail` be the last block of `u`. If
-
-    θ > p_thresh
-    and
-    ||Bnext*u_tail|| ≤ tol,
-
-then the vector is counted as reduced-space converged.
-
-Interpretation
---------------
-This is a reduced-space diagnostic for the block recurrence, not a substitute
-for original residuals.
-"""
-function count_reduced_converged(T::Symmetric{Float64,Matrix{Float64}},Bnext::AbstractMatrix{Float64};p_thresh::Float64=0.17,tol::Float64=1e-12)
-    E=eigen(T)
-    nev=0
-    @inbounds for j in eachindex(E.values)
-        E.values[j] < p_thresh && continue
-        tail=view(E.vectors,size(T,1)-size(Bnext,1)+1:size(T,1),j)
-        norm(Bnext*tail) <= tol && (nev+=1)
-    end
-    return nev
+    return λf[pe],Xf[:,pe],rf[pe],θsel
 end
 
 """
-    _progress_line(m,nev_conv,λ,res)
+    _progress_line(m,λ,res)
 
 Print a compact convergence summary for the one-cycle run.
 """
-function _progress_line(m,nev_conv,λ,res)
+function _progress_line(m,λ,res)
     if isempty(res)
-        println("m=",m,"  nev_conv=",nev_conv,"  inside=0  maxres=Inf")
+        println("m=",m,"  inside=0  maxres=Inf")
         return
     end
     rs=sort(res)
     r90=rs[clamp(round(Int,0.9*length(rs)),1,length(rs))]
     r95=rs[clamp(round(Int,0.95*length(rs)),1,length(rs))]
-    println("m=",m,"  nev_conv=",nev_conv,"  inside=",length(λ),"  r90=",r90,"  r95=",r95,"  maxres=",rs[end])
-end
-
-########################################################
-################ LOCKING / RESTART HELPERS #############
-########################################################
-
-"""
-    split_locked_working(λ,X,res;lock_tol)
-
-Split candidate pairs into
-- locked pairs with `res ≤ lock_tol`,
-- working pairs with `res > lock_tol`.
-
-This is useful for selecting the best unconverged vectors for restarting,
-although the present file returns after one cycle.
-"""
-function split_locked_working(λ::Vector{Float64},X::Matrix{Float64},res::Vector{Float64};lock_tol::Float64)
-    ilock=findall(<=(lock_tol),res)
-    iwork=findall(>(lock_tol),res)
-    λL=λ[ilock];XL=X[:,ilock];rL=res[ilock]
-    λW=λ[iwork];XW=X[:,iwork];rW=res[iwork]
-    return λL,XL,rL,λW,XW,rW
+    println("m=",m,"  inside=",length(λ),"  r90=",r90,"  r95=",r95,"  maxres=",rs[end])
 end
 
 """
-    append_locked!(Xlock,Xnew;rtol=1e-12)
-
-Append new converged vectors to a locked orthonormal basis, reorthogonalizing
-against the existing locked space.
-"""
-function append_locked!(Xlock::Matrix{Float64},Xnew::Matrix{Float64};rtol::Float64=1e-12)
-     # ------------------------------------------------------------
-    # Append new vectors to locked subspace
-    # ------------------------------------------------------------
-    #
-    # Input:
-    #   X_lock  = current orthonormal locked subspace
-    #   X_new   = newly converged candidate vectors
-    #
-    #   1) If X_new is empty:
-    #        return X_lock
-    #
-    #   2) If X_lock is empty:
-    #        return orth(X_new)
-    #
-    #   3) Remove overlap with locked space:
-    #        X_tmp ← (I - X_lock X_lockᵀ) X_new
-    #
-    #   4) Orthonormalize:
-    #        X_tmp ← orth(X_tmp)
-    #
-    #   5) If X_tmp is empty:
-    #        return X_lock
-    #
-    #   6) Merge and reorthonormalize:
-    #        X_lock ← orth([X_lock, X_tmp])
-    # ------------------------------------------------------------
-    size(Xnew,2)==0 && return Xlock
-    if size(Xlock,2)==0
-        return orth_block_polfed!(copy(Xnew);rtol=rtol)
-    end
-    Xtmp=copy(Xnew)
-    orth_against!(Xtmp,Xlock)
-    Xtmp=orth_block_polfed!(Xtmp;rtol=rtol)
-    size(Xtmp,2)==0 && return Xlock
-    return orth_block_polfed!(hcat(Xlock,Xtmp);rtol=rtol)
-end
-
-"""
-    make_restart_block(Xwork,Xlock,n,s;pad=8,rtol=1e-12,seed=nothing)
-
-Construct a restarted initial block from unconverged vectors plus random padding,
-orthogonalized against the locked subspace.
-
-Included here for completeness, although the present implementation is one-cycle
-only and does not perform outer restarts.
-"""
-function make_restart_block(Xwork::Matrix{Float64},Xlock::Matrix{Float64},n::Int,s::Int;pad::Int=8,rtol::Float64=1e-12,seed=nothing)
-    # ------------------------------------------------------------
-    # Restart block construction
-    # ------------------------------------------------------------
-    # Goal:
-    #   Build new initial block Q₀ of size s using:
-    #     - unconverged Ritz vectors (X_work)
-    #     - orthogonality against locked subspace (X_lock)
-    #     - random padding for missing directions
-    #
-    #   1) Select leading unconverged vectors:
-    #        X_sel ← first nkeep columns of X_work
-    #
-    #   2) Clean and orthonormalize:
-    #        X_sel ← (I - X_lock X_lockᵀ) X_sel
-    #        X_sel ← orth(X_sel)
-    #
-    #   3) Initialize restart block:
-    #        Q₀ ← X_sel
-    #
-    #   4) While dim(Q₀) < s:
-    #        G ← random Gaussian block
-    #        G ← (I - X_lock X_lockᵀ) G
-    #        G ← (I - Q₀ Q₀ᵀ) G
-    #        G ← orth(G)
-    #        append columns of G to Q₀
-    # ------------------------------------------------------------
-    !isnothing(seed) && Random.seed!(seed)
-    # number of unconverged vectors to retain in restart
-    # ensure at least 1 is kept
-    nkeep=min(size(Xwork,2),max(1,s-pad))
-    Q0=Matrix{Float64}(undef,n,0) # initialize restart block (empty, will grow to size s)
-    if nkeep>0
-        Xsel=copy(Xwork[:,1:nkeep]) # take leading unconverged candidates
-        orth_against!(Xsel,Xlock) # remove components along locked (already converged) subspace
-        Xsel=orth_block_polfed!(Xsel;rtol=rtol) # orthonormalize and truncate numerically dependent directions
-        size(Xsel,2)>0 && (Q0=hcat(Q0,Xsel)) # append cleaned working vectors to restart block
-    end
-    while size(Q0,2)<s
-        G=randn(n,s-size(Q0,2)) # generate random vectors to fill remaining slots
-        orth_against!(G,Xlock) # remove overlap with locked subspace
-        orth_against!(G,Q0) # remove overlap with already selected restart vectors
-        G=orth_block_polfed!(G;rtol=rtol) # orthonormalize and truncate numerically dependent directions
-        size(G,2)==0 && break # stop if no independent directions remain
-        take=min(size(G,2),s-size(Q0,2))  # number of columns to append 
-        Q0=hcat(Q0,G[:,1:take]) # append selected random directions
-    end
-    return Q0  # final restart block: orthonormal
-end
-
-"""
-    sort_by_residual(λ,X,r)
-
-Sort candidate pairs by increasing residual norm.
-"""
-function sort_by_residual(λ::Vector{Float64},X::Matrix{Float64},r::Vector{Float64})
-    p=sortperm(r)
-    return λ[p],X[:,p],r[p]
-end
-
-########################################################
-############### FULL-BASIS POLFED CYCLE ################
-########################################################
-
-"""
-    build_full_basis!(Qhist,Ablocks,Bblocks,A,Q1,Xlock,coeffs,smin,smax,Wbuf,work;
-                            mmax,threaded=true,rtol=1e-12,reorth_passes=2,show_progress=true)
+    build_full_basis!(Qhist,Ablocks,Bblocks,A,Q1,coeffs,smin,smax,Wbuf,work;
+                            mmax,threaded=true,rtol=1e-12,reorth_passes=1,show_progress=true)
 
 Build a single full filtered block basis of length at most `mmax`.
 
@@ -1194,7 +1019,7 @@ for the filtered operator `p(Â)`:
 The basis blocks are stored in `Qhist`, and the reduced block tridiagonal data
 are stored in `Ablocks` and `Bblocks`.
 """
-function build_full_basis!(Qhist::Vector{Matrix{Float64}},Ablocks::Vector{Matrix{Float64}},Bblocks::Vector{Matrix{Float64}},A,Q1::Matrix{Float64},Xlock::Matrix{Float64},coeffs::AbstractVector{Float64},smin::Float64,smax::Float64,Wbuf::AbstractMatrix{Float64},work::POLFEDWorkspace;mmax::Int,threaded::Bool=true,rtol::Float64=1e-12,reorth_passes::Int=2,show_progress::Bool=true)
+function build_full_basis!(Qhist::Vector{Matrix{Float64}},Ablocks::Vector{Matrix{Float64}},Bblocks::Vector{Matrix{Float64}},A,Q1::Matrix{Float64},coeffs::AbstractVector{Float64},smin::Float64,smax::Float64,Wbuf::AbstractMatrix{Float64},work::POLFEDWorkspace;mmax::Int,threaded::Bool=true,rtol::Float64=1e-12,reorth_passes::Int=1,show_progress::Bool=true)
     empty!(Qhist) # clear stored basis blocks Q₁,...,Q_m from previous run
     empty!(Ablocks) # clear reduced diagonal blocks A_j
     empty!(Bblocks) # clear reduced off-diagonal coupling blocks B_j
@@ -1220,11 +1045,10 @@ function build_full_basis!(Qhist::Vector{Matrix{Float64}},Ablocks::Vector{Matrix
     #
     #   3) Project onto current block:
     #        A_j ← Q_jᵀ W
-    #        W   ← W - Q_j A_j
+    #        W   ← W - Q_j A_j = W - Q_j Q_jᵀ W = (1 - Q_j Q_jᵀ) W
     #
     #   4) Reorthogonalize:
     #        W ← (I - Q_hist Q_histᵀ) W
-    #        W ← (I - X_lock X_lockᵀ) W
     #
     #   5) Normalize next block:
     #        [Q_{j+1}, B_j] ← QR(W)   (with rank truncation)
@@ -1257,9 +1081,8 @@ function build_full_basis!(Qhist::Vector{Matrix{Float64}},Ablocks::Vector{Matrix
         # W_j ← W_j - Q_j A_j
         W.-=Q*Aj
         for _ in 1:reorth_passes
-            # reorthogonalize against all previously stored basis blocks and current block
+            # reorthogonalize against all previously stored basis blocks and current block (does have effect on residuals in finite precision!)
             reorth_full!(W,Qhist,Q;passes=1)
-            orth_against!(W,Xlock) # placeholder for potential restart logic
         end
         # factor W ≈ Q_{j+1} B_j via truncated QR
         # Q_{j+1} becomes the next orthonormal basis block
@@ -1275,10 +1098,6 @@ function build_full_basis!(Qhist::Vector{Matrix{Float64}},Ablocks::Vector{Matrix
     return nothing
 end
 
-########################################################
-#################### MATRIX-FREE  ######################
-########################################################
-
 """
     polfed(A::MatrixFreeRealSymOp,nev,degree;kwargs...)
 
@@ -1290,8 +1109,23 @@ Key parameters
 - `s`: block size.
 - `mmax`: number of block steps; reduced-space dimension is roughly `M≈s*mmax`.
 - `degree`: polynomial degree of the Chebyshev filter.
+- `smin`, `smax`: spectral bounds for the filter; required for matrix-free operation. 
+- `sigma`: center of the filter; default is 0.0.
+- `emin`, `emax`: interval for selecting Ritz pairs; default is entire real line.
+- `tol`: tolerance for early exit based on residuals; default is 1e-10.
+- `threaded`: whether to use multi-threading in the filter application; default is true.
+- `overextract`: factor controlling how many Ritz pairs to extract from the reduced problem before original-space filtering; default is 2.
+- `refine`: whether to perform original-space Rayleigh–Ritz refinement on the extracted Ritz vectors; default is true.
+- `window_type`: type of window function for filter coefficients; default is `:step` (no window).
+- `jackson`: whether to apply Jackson damping to the filter coefficients; default is true.
+- `rtol`: relative tolerance for numerical rank truncation in block orthogonalization; default is 1e-12.
+- `reorth_passes`: number of reorthogonalization passes to perform in each iteration; default is 1.
+- `extra_keep`: number of extra Ritz pairs to keep beyond `nev` for safety in case of filtering inaccuracies; default is 8.
+- `seed`: random seed for reproducibility of the initial block; default is 1.
+- `show_progress`: whether to display a progress bar during basis construction; default is true.
+- `chunk`: number of Ritz pairs to process at a time during extraction to manage memory usage; default is 64. This is 
 """
-function polfed(A::MatrixFreeRealSymOp,nev::Int,degree::Int;s::Int=8,smin=nothing,smax=nothing,sigma::Float64=0.0,emin::Float64=-Inf,emax::Float64=Inf,tol::Float64=1e-10,threaded::Bool=true,overextract::Int=2,refine::Bool=true,window_type::Symbol=:step,jackson::Bool=true,mmax::Union{Nothing,Int}=nothing,p_thresh::Float64=0.17,reduced_tol::Float64=1e-12,rtol::Float64=1e-12,reorth_passes::Int=2,extra_keep::Int=8,seed::Int=1,show_progress::Bool=true,lock_tol::Float64=1e-6,restart_pad::Int=8)
+function polfed(A::MatrixFreeRealSymOp,nev::Int,degree::Int;s::Int=8,smin=nothing,smax=nothing,sigma::Float64=0.0,emin::Float64=-Inf,emax::Float64=Inf,tol::Float64=1e-10,threaded::Bool=true,overextract::Int=2,refine::Bool=true,window_type::Symbol=:step,jackson::Bool=true,mmax::Union{Nothing,Int}=nothing,rtol::Float64=1e-12,reorth_passes::Int=1,extra_keep::Int=8,seed::Int=1,show_progress::Bool=true,chunk=64)
     n=A.n
     (smin===nothing || smax===nothing) && error("Matrix-free POLFED requires spectral bounds smin and smax")
     coeffs=_build_coeffs(degree,smin,smax,sigma,emin,emax;window_type=window_type,jackson=jackson) # build chebyshev coefficients with optional jackson damping
@@ -1303,20 +1137,14 @@ function polfed(A::MatrixFreeRealSymOp,nev::Int,degree::Int;s::Int=8,smin=nothin
     Qhist=Matrix{Float64}[] # stores block basis V = [Q₁,…,Q_m] (block-by-block)
     Ablocks=Matrix{Float64}[] # diagonal blocks A_j = Q_jᵀ p(Â) Q_j (reduced operator)
     Bblocks=Matrix{Float64}[] # off-diagonal blocks B_j from block Lanczos recurrence (coupling between blocks)
-    Xlock=Matrix{Float64}(undef,n,0) # placeholder for potential restart implementation
     # construct filtered block Krylov basis for p(Â): generates Q_j, A_j, B_j so that p(A) V ≈ V T
-    build_full_basis!(Qhist,Ablocks,Bblocks,A,Q1,Xlock,coeffs,smin,smax,Wbuf,work;mmax=mmax,threaded=threaded,rtol=rtol,reorth_passes=reorth_passes,show_progress=show_progress)
+    build_full_basis!(Qhist,Ablocks,Bblocks,A,Q1,coeffs,smin,smax,Wbuf,work;mmax=mmax,threaded=threaded,rtol=rtol,reorth_passes=reorth_passes,show_progress=show_progress)
     # solve reduced eigenproblem T u = θ u,
     # reconstruct Ritz vectors X = V u,
     # compute original Rayleigh quotients λ and residuals,
     # keep candidates inside [emin,emax]
-    λ,X,res,θ=extract_pairs_direct(Qhist,Ablocks,Bblocks,A;nev=nev,emin=emin,emax=emax,overextract=overextract,refine=refine,extra_keep=extra_keep)
-    T=assemble_T(Ablocks,Bblocks) # explicitly form reduced symmetric block-tridiagonal matrix T
-    Bnext=isempty(Bblocks) ? Matrix{Float64}(undef,0,0) : Bblocks[end]  # last coupling block, used for convergence test
-    # count reduced eigenpairs whose tail is decoupled:
-    # ||B_next * u_tail|| small ⇒ approximate invariant subspace
-    nev_conv=size(Bnext,1)==0 ? 0 : count_reduced_converged(T,Bnext;p_thresh=p_thresh,tol=reduced_tol)
-    _progress_line(length(Qhist),nev_conv,λ,res)
+    λ,X,res,θ=extract_pairs(Qhist,Ablocks,Bblocks,A;nev=nev,emin=emin,emax=emax,overextract=overextract,refine=refine,extra_keep=extra_keep,chunk=chunk)
+    _progress_line(length(Qhist),λ,res)
     if !isempty(res) && length(res)>=nev
         rs=sort(res)
         rs[nev] < tol && return λ[1:nev],X[:,1:nev],res[1:nev] # early exit if best nev residuals satisfy tolerance
@@ -1335,22 +1163,16 @@ end
 Convenience wrapper constructing a matrix-free real symmetric operator
 from user-supplied actions and calling `polfed`.
 
-Arguments
----------
+Additional arguments
+---------------------
 - `matvec! :: Function`
     In-place vector action `y ← A*x`.
 
 - `n :: Int`
     Dimension of the operator.
 
-- `nev :: Int`
-    Number of desired eigenpairs in `[emin,emax]`.
-
-- `degree :: Int`
-    Degree of the Chebyshev filter polynomial.
-
-Keyword arguments
------------------
+Additional keyword arguments
+-----------------------------
 - `matblock! :: Function or nothing` (default: `nothing`)
     Optional in-place block action `Y ← A*X`. This should always
     be added for faster performance when available.
@@ -1415,24 +1237,27 @@ if abspath(PROGRAM_FILE)==@__FILE__
 ########################################################
 ######################## TEST ##########################
 ########################################################
+
+BLAS.set_num_threads(Sys.CPU_THREADS)
     
-n=60000
+n=150_000
 nev=1000
 s=64
-degree=64
-b=5.0 # b=5.0 is good for nev=1000
+degree=400
+b=3.0
 mmax=ceil(Int,b*nev/s)
-window_type=:smooth
+window_type=:smooth # for very large n use :delta here
 
 λexact,i1,i2,emin,emax,sigma=lap1d_target_window(n,nev)
 
 @info "\n matrix size n=$(n) \n nev=$(nev) \n s=$(s) \n degree=$(degree) \n b=$(b) \n mmax=$(mmax) \n window_type=$(window_type)"
-Aop=MatrixFreeRealSymOp(n,lap1d_matvec!)
+Aop=MatrixFreeRealSymOp(n,lap1d_matvec!,lap1d_matblock!)
 
 # smin, smax are the spectral bounds which for the case of the 1d laplacian are 0.0 - 4.0.
 # emin and emax are the target energies in the middle and we want nev of them (this is what lap1d_target_window computes)
 # good convergence is an interplay between degree and b. Usually a higher degree allows for a smaller b and vice versa. This depends on the sparse matrix and target window.
-λ,X,res=polfed(Aop,nev,degree;s=s,smin=0.0,smax=4.0,sigma=sigma,emin=emin,emax=emax,tol=1e-6,window_type=:delta,mmax=mmax,overextract=2,reorth_passes=2,lock_tol=1e-3,restart_pad=0)
+# also if convergence is just a bit smaller than wanted increase reorth_passes (usually 1 is enough)
+λ,X,res=polfed(Aop,nev,degree;s=s,smin=0.0,smax=4.0,sigma=sigma,emin=emin,emax=emax,tol=1e-6,window_type=:delta,mmax=mmax,overextract=2,reorth_passes=1,show_progress=true,extra_keep=8,chunk=64)
 
 end
 
@@ -1440,7 +1265,7 @@ end
 #### RESULTS ####
 #################
 
-#= What one should get for the laplacian 1d sparse matrix (M3 max)
+#= What one should get for the laplacian 1d sparse matrix (M3 max, 64 Gb RAM)
 
 nev_conv : number of reduced eigenvectors of T whose tail is decoupled (||B_next * u_tail|| small)
 inside : number of Ritz pairs with Rayleigh quotients inside the target interval [emin,emax] (we wanted nev=1000)
@@ -1460,29 +1285,29 @@ NOTE: There is a final dense eigen! that is not taken into the main timing and d
 │  mmax=79 
 └  window_type=smooth
 Cycle 100%|█████████████████████████████████████████████████████████████████████████████████████████| Time: 0:00:19
-m=79  nev_conv=1372  inside=1000  r90=1.263385139348521e-14  r95=1.4465502435677196e-14  maxres=3.1117078311317e-14
+m=79  inside=1000  r90=1.263385139348521e-14  r95=1.4465502435677196e-14  maxres=3.1117078311317e-14
 
 ┌ Info: 
 │  matrix size n=60000 
 │  nev=1000 
 │  s=64 
-│  degree=64 
-│  b=5.0 
-│  mmax=79 
+│  degree=128 
+│  b=3.0 
+│  mmax=47 
 └  window_type=smooth
-Cycle 100%|█████████████████████████████████████████████████████████████████████████████████████████| Time: 0:01:29
-m=79  nev_conv=1587  inside=998  r90=2.3091340227067377e-14  r95=2.8160811261018643e-14  maxres=4.1088813471831286e-14
+Cycle 100%|████████████████████████████████████████████████████████████████████████████████████████████| Time: 0:00:36
+m=47  inside=999  r90=2.3431295846617787e-14  r95=2.8476247888023835e-14  maxres=2.175237376209596e-12
 
 ┌ Info: 
 │  matrix size n=150000 
 │  nev=1000 
 │  s=64 
-│  degree=512 
+│  degree=400 
 │  b=3.0 
 │  mmax=47 
 └  window_type=smooth
-Cycle 100%|█████████████████████████████████████████████████████████████████████████████████████████| Time: 0:03:08
-m=47  nev_conv=1552  inside=1001  r90=3.423428512322939e-14  r95=4.388197568983557e-14  maxres=0.042760445938446114 -> one extra included that is just outside the interval that gives very large maxres
+Cycle 100%|████████████████████████████████████████████████████████████████████████████████████████████| Time: 0:02:13
+m=47  inside=998  r90=3.370908181692764e-14  r95=4.0029332417106185e-14  maxres=7.502190770434304e-14
 
 ┌ Info: 
 │  matrix size n=300000 
@@ -1492,19 +1317,21 @@ m=47  nev_conv=1552  inside=1001  r90=3.423428512322939e-14  r95=4.3881975689835
 │  b=3.0 
 │  mmax=47 
 └  window_type=smooth
-Cycle 100%|█████████████████████████████████████████████████████████████████████████████████████████| Time: 0:08:09
-m=47  nev_conv=1972  inside=998  r90=4.792409513888924e-14  r95=5.532738377720123e-14  maxres=1.1440630483624246e-13
+Cycle 100%|████████████████████████████████████████████████████████████████████████████████████████████| Time: 0:06:56
+m=47  inside=998  r90=4.851085163074631e-14  r95=5.668566328697754e-14  maxres=9.447243092189946e-14
 
-┌ Info: 
+# Run with nev=1600 and degree=800 
+
+ Info: 
 │  matrix size n=350000 
-│  nev=1000
+│  nev=1600 
 │  s=64 
-│  degree=512 
-│  b=5.0
-│  mmax=79 
-└  window_type=smooth
-Cycle 100%|████████████████████████████████████████████████████████████████████████████████████████████| Time: 0:14:28
-m=79  nev_conv=3564  inside=999  r90=5.366536473516787e-14  r95=6.553000879788426e-14  maxres=1.9795493108897427e-10
+│  degree=800 
+│  b=3.0 
+│  mmax=75 
+└  window_type=delta
+Cycle 100%|████████████████████████████████████████████████████████████████████████████████████████████| Time: 0:14:51
+m=75  inside=1599  r90=5.406490405565137e-14  r95=6.560545613539887e-14  maxres=2.12138039476538e-11
 
 ############ COMPARING n=450_000 with varying degree and b ############
 
@@ -1517,7 +1344,7 @@ m=79  nev_conv=3564  inside=999  r90=5.366536473516787e-14  r95=6.55300087978842
 │  mmax=79 
 └  window_type=smooth
 Cycle 100%|█████████████████████████████████████████████████████████████████████████████████████████| Time: 0:23:38
-m=79  nev_conv=3278  inside=998  r90=6.294294088644106e-14  r95=7.424619128109143e-14  maxres=1.1966103393555824e-13
+m=79  inside=998  r90=6.294294088644106e-14  r95=7.424619128109143e-14  maxres=1.1966103393555824e-13
 
 ┌ Info: 
 │  matrix size n=450000 
@@ -1527,10 +1354,9 @@ m=79  nev_conv=3278  inside=998  r90=6.294294088644106e-14  r95=7.42461912810914
 │  b=3.0 
 │  mmax=47 
 └  window_type=smooth
-Cycle 100%|█████████████████████████████████████████████████████████████████████████████████████████| Time: 0:16:46
-m=47  nev_conv=1847  inside=1007  r90=6.467657115216587e-14  r95=7.793197165704078e-14  maxres=0.01888119337124759 -> sligthly faster but includes some extra pairs (exactly 7) just outside the interval as inside and therefore increases maxres. maxres is only small if really there is no small outside polution.
+Cycle 100%|████████████████████████████████████████████████████████████████████████████████████████████| Time: 0:15:37
+m=47  nev_conv=1847  inside=1007  r90=6.286578274842279e-14  r95=7.545085171066087e-14  maxres=0.01888119337120290  -> sligthly faster but includes some extra pairs (exactly 7) just outside the interval as inside and therefore increases maxres. maxres is only small if really there is no small outside polution.
 
-➜  POLFED julia -t auto polfed_for_header.jl
 ┌ Info: 
 │  matrix size n=650000 
 │  nev=1000 
@@ -1540,11 +1366,25 @@ m=47  nev_conv=1847  inside=1007  r90=6.467657115216587e-14  r95=7.7931971657040
 │  mmax=79 
 └  window_type=smooth
 Cycle 100%|█████████████████████████████████████████████████████████████████████████████████████████| Time: 0:38:09
-m=79  nev_conv=3483  inside=1000  r90=7.199055102796388e-14  r95=8.595247481961762e-14  maxres=1.2347500904341446e-13
+m=79  inside=1000  r90=7.199055102796388e-14  r95=8.595247481961762e-14  maxres=1.2347500904341446e-13
 
-#######################
-For very large matrices it is extremely important to know how degree and b interplay! Below we can see that b=3.0 is enough with degree = 2500 to get convergence nad only taking about 2h, while if we keep degree low = 1600 and larger b=5.0 we get much longer time with same quality of results
-Usually the approach is to increase degree rather than increase b
+
+
+
+######################################################################
+For very large matrices it is extremely important to know how degree and b interplay!
+Usually the approach is to increase degree rather than increase b.
+
+┌ Info: 
+│  matrix size n=1048576
+│  nev=1000 
+│  s=64 
+│  degree=3500 
+│  b=2.0 
+│  mmax=32 
+└  window_type=delta
+Cycle 100%|████████████████████████████████████████████████████████████████████████████████████████████| Time: 0:58:11
+m=32  inside=1000  r90=8.773094039016345e-14  r95=1.0435955357749034e-13  maxres=2.070560874529873e-13
 
 ┌ Info: 
 │  matrix size n=1048576 
@@ -1554,8 +1394,7 @@ Usually the approach is to increase degree rather than increase b
 │  mmax=47 
 └  window_type=delta
 Cycle 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| Time: 2:13:13
-m=47  nev_conv=1967  inside=999  r90=6.2752806221874154e-15  r95=6.709334573082644e-15  maxres=2.576533337148389e-11
-
+m=47  inside=999  r90=6.2752806221874154e-15  r95=6.709334573082644e-15  maxres=2.576533337148389e-11
 
 ┌ Info: 
 │  matrix size n=1048576 
@@ -1565,6 +1404,7 @@ m=47  nev_conv=1967  inside=999  r90=6.2752806221874154e-15  r95=6.7093345730826
 │  mmax=94 
 └  window_type=delta
 Cycle 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| Time: 3:55:04
-m=94  nev_conv=3514  inside=999  r90=5.991394217652792e-15  r95=6.679527965337017e-15  maxres=2.4792930459694443e-11
+m=94  inside=999  r90=5.991394217652792e-15  r95=6.679527965337017e-15  maxres=2.4792930459694443e-11
 
 =#
+
