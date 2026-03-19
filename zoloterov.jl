@@ -152,8 +152,6 @@
 #   Zolotarev Quadrature Rules and Load Balancing for the FEAST Eigensolver, Güttel S., Tak Peter Tang P., Viaud G., https://arxiv.org/abs/1407.8078
 #
 # BROUGHT TO YOU BY THE POWER OF CHATGPT-5.2
-# EDITING: Orel 10/3/2026
-# * If editing file/want to add things, give your surname and date in the comment above, and briefly describe what you changed
 # ==============================================================================
 
 
